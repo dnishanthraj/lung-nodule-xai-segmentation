@@ -1,0 +1,12 @@
+streamlit
+pandas
+numpy
+pillow
+altair
+matplotlib
+scikit-image
+scipy
+statsmodels
+streamlit-drawable-canvas
+streamlit-image-zoom
+torch
