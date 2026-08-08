@@ -6,6 +6,7 @@
 import pandas as pd                    # Data manipulation and analysis
 import argparse                         # Command-line argument parsing
 import os                               # OS operations (path, environment variables)
+from pathlib import Path                # Filesystem-relative path resolution
 from collections import OrderedDict     # Maintaining order of dictionary elements
 from glob import glob                   # File pattern matching
 import yaml                             # YAML file processing (saving/loading configs)
@@ -16,7 +17,6 @@ import torch
 import torch.backends.cudnn as cudnn    # cuDNN backend for GPU acceleration
 import torch.nn as nn                   # Neural network components
 import torch.optim as optim             # Optimization algorithms
-from torch.optim import lr_scheduler    # Learning rate scheduling
 from torch.optim.lr_scheduler import StepLR  # Step learning rate decay
 from datetime import datetime           # Timestamping
 import uuid                              # Unique identifier generation
@@ -26,7 +26,6 @@ from torch.utils.data.distributed import DistributedSampler    # Distributed sam
 
 # Machine Learning utilities
 from sklearn.model_selection import KFold       # K-Fold cross-validation
-import albumentations as albu                    # Data augmentation library
 from sklearn.model_selection import train_test_split  # Splitting data into train/test
 from tqdm import tqdm                             # Progress bar for loops
 
@@ -37,8 +36,8 @@ from metrics import iou_score, dice_coef                       # Evaluation metr
 from utils import AverageMeter, str2bool                       # Utility functions
 
 # Model architectures
-from Unet.unet_model import UNet                    # Standard U-Net model
-from UnetNested.Nested_Unet import NestedUNet        # Nested U-Net model (UNet++)
+from unet.unet_model import UNet                    # Standard U-Net model
+from unet_nested.nested_unet import NestedUNet        # Nested U-Net model (UNet++)
 
 # ---------------------------------------------------------
 # Environment Setup
@@ -135,12 +134,12 @@ def train(train_loader, model, criterion, optimizer):
     pbar = tqdm(total=len(train_loader), desc="Training", disable=(dist.get_rank() != 0))
 
     # Iterate over training data
-    for input, target in train_loader:
-        input = input.cuda()
+    for images, target in train_loader:
+        images = images.cuda()
         target = target.cuda()
 
         # Forward pass
-        output = model(input)
+        output = model(images)
 
         # Compute loss and evaluation metrics
         loss = criterion(output, target)
@@ -155,9 +154,9 @@ def train(train_loader, model, criterion, optimizer):
         optimizer.step()
 
         # Update average metrics
-        avg_meters['loss'].update(loss.item(), input.size(0))
-        avg_meters['iou'].update(iou, input.size(0))
-        avg_meters['dice'].update(dice, input.size(0))
+        avg_meters['loss'].update(loss.item(), images.size(0))
+        avg_meters['iou'].update(iou, images.size(0))
+        avg_meters['dice'].update(dice, images.size(0))
 
         # Update progress bar
         postfix = OrderedDict([
@@ -203,12 +202,12 @@ def validate(val_loader, model, criterion):
         pbar = tqdm(total=len(val_loader), desc="Validation", disable=(dist.get_rank() != 0))
 
         # Iterate over validation data
-        for input, target in val_loader:
-            input = input.cuda().float()
+        for images, target in val_loader:
+            images = images.cuda().float()
             target = target.cuda().float()
 
             # Forward pass
-            output = model(input)
+            output = model(images)
 
             # Compute loss and evaluation metrics
             loss = criterion(output, target)
@@ -216,9 +215,9 @@ def validate(val_loader, model, criterion):
             dice = dice_coef(output, target)
 
             # Update average metrics
-            avg_meters['loss'].update(loss.item(), input.size(0))
-            avg_meters['iou'].update(iou, input.size(0))
-            avg_meters['dice'].update(dice, input.size(0))
+            avg_meters['loss'].update(loss.item(), images.size(0))
+            avg_meters['iou'].update(iou, images.size(0))
+            avg_meters['dice'].update(dice, images.size(0))
 
             # Update progress bar
             postfix = OrderedDict([
@@ -395,9 +394,12 @@ def main():
     scheduler = StepLR(optimizer, step_size=40, gamma=0.8)
 
     # ----------------- Dataset Preparation -----------------
-    IMAGE_DIR = '/dcs/22/u2202609/year_3/cs310/Project/Preprocessing/data/Image/' # You should set your own paths here to the correct Preprocessing directory.
-    MASK_DIR = '/dcs/22/u2202609/year_3/cs310/Project/Preprocessing/data/Mask/'
-    meta = pd.read_csv('/dcs/22/u2202609/year_3/cs310/Project/Preprocessing/csv/meta.csv')
+    # Resolved relative to this script's location so the repo is runnable
+    # on any machine without editing hardcoded paths.
+    preprocessing_dir = Path(__file__).resolve().parent.parent / 'preprocessing'
+    IMAGE_DIR = str(preprocessing_dir / 'data' / 'Image') + os.sep
+    MASK_DIR = str(preprocessing_dir / 'data' / 'Mask') + os.sep
+    meta = pd.read_csv(preprocessing_dir / 'csv' / 'meta.csv')
 
     # Attach absolute file paths
     meta['original_image'] = meta['original_image'].apply(lambda x: IMAGE_DIR + x + '.npy')

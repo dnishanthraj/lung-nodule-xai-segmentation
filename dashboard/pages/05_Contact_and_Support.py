@@ -9,9 +9,10 @@ import os
 # -------------------------------------------------------
 # Email Configuration
 # -------------------------------------------------------
-# Set your support email address here
-EMAIL_ADDRESS = "dnishanthraj@gmail.com"  # Replace with your email
-EMAIL_PASSWORD = "..."  # Omitted for security reasons.
+# Set SUPPORT_EMAIL_ADDRESS / SUPPORT_EMAIL_PASSWORD in your environment
+# (e.g. a Gmail address with an app password) to enable the contact form.
+EMAIL_ADDRESS = os.environ.get("SUPPORT_EMAIL_ADDRESS")
+EMAIL_PASSWORD = os.environ.get("SUPPORT_EMAIL_PASSWORD")
 
 # -------------------------------------------------------
 # Page Configuration
@@ -112,7 +113,12 @@ with st.form(key="contact_form"):
     submit_button = st.form_submit_button("Send Message")
 
     if submit_button:
-        if user_name and user_email and user_message:
+        if not (EMAIL_ADDRESS and EMAIL_PASSWORD):
+            st.warning(
+                "Support email isn't configured. Set the SUPPORT_EMAIL_ADDRESS "
+                "and SUPPORT_EMAIL_PASSWORD environment variables to enable this form."
+            )
+        elif user_name and user_email and user_message:
             try:
                 # -------------------------------------------------------
                 # Email Sending Logic

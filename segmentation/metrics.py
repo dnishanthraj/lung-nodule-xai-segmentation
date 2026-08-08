@@ -208,7 +208,7 @@ def calculate_fp(prediction_dir, mask_dir, distance_threshold=80):
                 lab = np.array(labeled_array)
                 lab[lab != (n + 1)] = 0
                 lab[lab == (n + 1)] = 1
-                predict_com = np.array(ndi.center_of_mass(labeled_array))
+                predict_com = np.array(ndi.center_of_mass(lab))
                 if np.linalg.norm(predict_com - answer_com, 2) < distance_threshold:
                     patience += 1
                 else:
@@ -249,7 +249,7 @@ def calculate_fp_clean_dataset(prediction_dir, distance_threshold=80):
                 lab = np.array(labeled_array)
                 lab[lab != (n + 1)] = 0
                 lab[lab == (n + 1)] = 1
-                predict_com = np.array(ndi.center_of_mass(labeled_array))
+                predict_com = np.array(ndi.center_of_mass(lab))
 
                 if previous_com[0] == -1:
                     confusion_matrix[2] += 1  # FP

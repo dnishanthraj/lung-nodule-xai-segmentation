@@ -71,8 +71,6 @@ ensuring more meaningful visualization.
 # ---------------------------------------------------
 # 1) PATH SETUP
 # ---------------------------------------------------
-ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-
 # Sidebar heading
 st.sidebar.markdown("## Sidebar Settings")
 

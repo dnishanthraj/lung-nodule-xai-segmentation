@@ -8,19 +8,18 @@ import torch
 import sys
 import numpy as np
 import scipy.stats as stats
-import statsmodels.api as sm
 from statsmodels.formula.api import ols
 from statsmodels.stats.multicomp import pairwise_tukeyhsd
 from pathlib import Path
 
 # -------------------------------------------------------
-# Add Segmentation directory to sys.path for custom metric imports
+# Add segmentation directory to sys.path for custom metric imports
 # -------------------------------------------------------
-SEGMENTATION_DIR = Path(__file__).resolve().parents[2] / "Segmentation"
+SEGMENTATION_DIR = Path(__file__).resolve().parents[2] / "segmentation"
 sys.path.append(str(SEGMENTATION_DIR))
 
 # -------------------------------------------------------
-# Import metrics functions from Segmentation module
+# Import metrics functions from segmentation module
 # -------------------------------------------------------
 from metrics import dice_coef2, iou_score, calculate_precision, calculate_recall, calculate_fpps
 

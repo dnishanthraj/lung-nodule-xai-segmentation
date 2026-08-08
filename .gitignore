@@ -1,27 +1,41 @@
-# Ignore all log files
+# Byte-compiled / cache files
+**/__pycache__/
+*.pyc
+
+# OS / editor cruft
+.DS_Store
+.idea/
+.vscode/
+
+# Logs
 *.log
 
-# Ignore entire folders
-/Preprocessing/__pycache__/
-/Preprocessing/data/
-/Segmentation/__pycache__/
-/Segmentation/myenv/
-/Segmentation/Segmentation_output/
-/Segmentation/Unet/__pycache__/
-/Segmentation/UnetNested/__pycache__/
+# Generated config (produced by preprocessing/config_file_create.py)
+/lung.conf
+
+# Preprocessing
+/preprocessing/data/
+/preprocessing/notebook/
+
+# Segmentation
+/segmentation/myenv/
+/segmentation/segmentation_output/
+/segmentation/joboutput_*.out
+/segmentation/joboutput_*.err
+/segmentation/configuration.txt
+/segmentation/model_outputs/
+/segmentation/figures/
+/segmentation/grad_cam_outputs/
+*.pkl
+
+# Local-only scratch scripts (never intended to be tracked)
+/segmentation/train1.py
+/segmentation/validate1.py
+/segmentation/testing_grad_cam.py
+/segmentation/fp_classifier.py
+
+# Dashboard
+/dashboard/.streamlit
+
+# Datasets
 /LIDC-IDRI Dataset/
-/Segmentation/joboutput_*.out
-/Segmentation/joboutput_*.err
-# /Segmentation/*.sbatch
-/Segmentation/configuration.txt
-/Segmentation/model_outputs
-/Segmentation/figures
-/Segmentation/grad_cam_outputs
-/Segmentation/train1.py
-/Segmentation/validate1.py
-/Segmentation/testing_grad_cam.py
-/Segmentation/fp_classifier.py
-/Dashboard/__pycache__
-/Dashboard/.streamlit
-/Dashboard/components/__pycache__
-/Preprocessing/notebook/

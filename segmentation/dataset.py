@@ -7,8 +7,6 @@ import glob
 
 import torch
 from torch.utils.data.dataset import Dataset
-import torchvision.transforms.functional as TF
-import torchvision
 from torchvision import transforms
 
 import albumentations as albu

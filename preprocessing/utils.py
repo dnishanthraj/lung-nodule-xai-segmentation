@@ -2,7 +2,6 @@
 # Utility functions for LIDC-IDRI Dataset Processing
 # -----------------------------------------------
 
-import argparse
 import os
 import numpy as np
 
@@ -108,19 +107,3 @@ def segment_lung(img):
 
     # Apply mask to the original image (preserving lung regions only)
     return mask * img
-
-
-# -------------------------------
-# Count Trainable Parameters
-# -------------------------------
-def count_params(model):
-    """
-    Count the number of trainable parameters in a PyTorch model.
-
-    Args:
-        model (torch.nn.Module): The PyTorch model.
-
-    Returns:
-        int: Total number of trainable parameters.
-    """
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)

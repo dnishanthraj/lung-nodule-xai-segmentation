@@ -79,12 +79,12 @@ class NestedUNet(nn.Module):
         self.final = nn.Conv2d(nb_filter[0], num_classes, kernel_size=1)
 
 
-    def forward(self, input):
+    def forward(self, x):
         """
         Forward pass through Nested U-Net.
         """
         # Encoder Path
-        x0_0 = self.conv0_0(input)
+        x0_0 = self.conv0_0(x)
         x1_0 = self.conv1_0(self.pool(x0_0))
         x0_1 = self.conv0_1(torch.cat([x0_0, self.up(x1_0)], dim=1))
 

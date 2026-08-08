@@ -16,6 +16,7 @@ source /etc/profile.d/conda.sh
 
 ## Execute your program(s) ##
 module load CUDA
-python validate.py --name NestedUNET --augmentation True --folder NestedUNET_with_augmentation_20250426_122016_315f9c91
-
-# torchrun --nproc_per_node=NUM_GPUS validate.py ---name NestedUNET --augmentation True --folder NestedUNET_with_augmentation_20250126_131118_4f8e5884
+# --folder must match a run directory name already present under
+# segmentation/model_outputs/ (created by a prior train.py run), e.g.
+# NestedUNET_with_augmentation_<timestamp>_<run-id>
+python validate.py --name NestedUNET --augmentation True --folder <RUN_FOLDER_NAME>

@@ -20,26 +20,26 @@ class BCEDiceLoss(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(self, input, target):
+    def forward(self, inputs, target):
         """
         Args:
-            input (torch.Tensor): Raw logits from model.
+            inputs (torch.Tensor): Raw logits from model.
             target (torch.Tensor): Binary ground-truth masks.
 
         Returns:
             torch.Tensor: Combined BCE + Dice loss value.
         """
         # Binary Cross-Entropy Loss
-        bce = F.binary_cross_entropy_with_logits(input, target)
+        bce = F.binary_cross_entropy_with_logits(inputs, target)
 
         # Dice Loss
         smooth = 1e-5
-        input = torch.sigmoid(input)
+        inputs = torch.sigmoid(inputs)
         num = target.size(0)
-        input = input.view(num, -1)
+        inputs = inputs.view(num, -1)
         target = target.view(num, -1)
-        intersection = (input * target)
-        dice = (2. * intersection.sum(1) + smooth) / (input.sum(1) + target.sum(1) + smooth)
+        intersection = (inputs * target)
+        dice = (2. * intersection.sum(1) + smooth) / (inputs.sum(1) + target.sum(1) + smooth)
         dice = 1 - dice.sum() / num
 
         # Final combined loss

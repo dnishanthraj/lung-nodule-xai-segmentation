@@ -17,8 +17,6 @@ source /etc/profile.d/conda.sh
 
 ## Execute your program(s) ##
 module load CUDA
-# python train.py --name NestedUNET --augmentation True 
-# torchrun --nproc_per_node=3 train.py --name NestedUNET --augmentation True
 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 torchrun --nproc_per_node=3 train.py --name NestedUNET --augmentation True
 
 

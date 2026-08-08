@@ -78,12 +78,4 @@ class GradCAM:
         # Normalize heatmap to [0, 1]
         grad_cam = (grad_cam - grad_cam.min()) / (grad_cam.max() - grad_cam.min())
 
-        # -------------------------------
-        # Debugging (Optional Prints)
-        # -------------------------------
-        # print("Activation shape:", self.activation.shape)
-        # print("Gradient shape:", self.gradients.shape)
-        # print("Weights shape:", weights.shape)
-        # print("Grad-CAM shape:", grad_cam.shape)
-
         return grad_cam

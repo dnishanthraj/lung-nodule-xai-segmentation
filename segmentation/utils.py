@@ -17,9 +17,9 @@ def str2bool(v):
     Raises:
         argparse.ArgumentTypeError: If the input is not a valid boolean string.
     """
-    if v.lower() in ['true', 1]:
+    if v.lower() in ('true', '1', 'yes'):
         return True
-    elif v.lower() in ['false', 0]:
+    elif v.lower() in ('false', '0', 'no'):
         return False
     else:
         raise argparse.ArgumentTypeError('Boolean value expected.')

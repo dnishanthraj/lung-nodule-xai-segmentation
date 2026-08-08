@@ -14,7 +14,8 @@ import re
 # Import helper functions from dashboard components
 from components import (
     calculate_precision, calculate_recall, calculate_fpps,
-    get_color_and_description_overall, load_log_data, lighten_color
+    get_color_and_description_overall, load_log_data, lighten_color,
+    MODEL_OUTPUTS_BASE_DIR
 )
 
 # Set Streamlit page configuration
@@ -55,9 +56,8 @@ st.markdown("""
 # PATH SETUP
 # ---------------------------------------------------
 
-# Define root and model output paths
-ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-MODEL_OUTPUTS_DIR = os.path.join(ROOT_DIR, "Project", "Segmentation", "model_outputs")
+# Model output path (single source of truth: components.constants)
+MODEL_OUTPUTS_DIR = MODEL_OUTPUTS_BASE_DIR
 
 # Initialise folder settings state if missing
 if "folder_settings" not in st.session_state:

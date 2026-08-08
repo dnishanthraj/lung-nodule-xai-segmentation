@@ -5,13 +5,12 @@
 # ----------------------------
 import argparse
 import os
-from glob import glob
+from pathlib import Path
 from collections import OrderedDict
 import numpy as np
 import pandas as pd
 import torch
 import torch.backends.cudnn as cudnn
-import torch.nn as nn
 import yaml
 import time
 import joblib
@@ -19,19 +18,19 @@ import xgboost as xgb
 from tqdm import tqdm
 
 # Morphological analysis utilities
-from skimage.measure import regionprops, label as sklabel
+from skimage.measure import regionprops
 from scipy.ndimage import center_of_mass, generate_binary_structure, label as ndi_label
 
 # Model architectures
-from Unet.unet_model import UNet
-from UnetNested.Nested_Unet import NestedUNet  # Note: naming matches usage below
+from unet.unet_model import UNet
+from unet_nested.nested_unet import NestedUNet
 
 # Local modules
 from dataset import MyLidcDataset
 from metrics import (
-    iou_score, dice_coef2, calculate_fp, calculate_fp_clean_dataset, 
-    calculate_accuracy, calculate_f1_score, calculate_specificity, 
-    calculate_precision, calculate_recall, calculate_fpps, save_metrics_to_csv
+    iou_score, dice_coef2, calculate_fp, calculate_fp_clean_dataset,
+    calculate_accuracy, calculate_precision, calculate_recall, calculate_fpps,
+    save_metrics_to_csv
 )
 from utils import AverageMeter, str2bool
 from grad_cam import GradCAM
@@ -47,8 +46,8 @@ def parse_args():
     Parses command-line arguments for validation script.
 
     Returns:
-        argparse.Namespace: Parsed arguments including model name, 
-                            augmentation flag, output folder, 
+        argparse.Namespace: Parsed arguments including model name,
+                            augmentation flag, output folder,
                             and distance threshold for FPR classification.
     """
     parser = argparse.ArgumentParser()
@@ -81,7 +80,7 @@ def is_true_detection(pred_mask, gt_mask, distance_threshold=80):
     Args:
         pred_mask (np.ndarray): Predicted binary mask.
         gt_mask (np.ndarray): Ground truth binary mask.
-        distance_threshold (float): Maximum allowed distance between 
+        distance_threshold (float): Maximum allowed distance between
                                     predicted and ground truth centers of mass.
 
     Returns:
@@ -201,7 +200,120 @@ def apply_fpr_classifier(pred_mask, classifier, distance_threshold=80):
 
 
 #############################
-# FP Classifier Training 
+# Inference Pass
+#############################
+
+def run_inference_pass(loader, model, output_dir, grad_cam_dir, image_paths,
+                        grad_cam_generator, desc, classifier=None,
+                        distance_threshold=80):
+    """
+    Runs one full pass of the model over `loader`, saving predicted masks and
+    Grad-CAM heatmaps and collecting IoU/Dice metrics.
+
+    If `classifier` is None, this reproduces the "raw" evaluation: metrics are
+    computed directly on the model's logits (matching the original raw-pass
+    behaviour), and the sigmoid-thresholded mask is what gets saved.
+
+    If `classifier` is given, each sigmoid-thresholded mask is passed through
+    the FPR (false-positive reduction) classifier first, and metrics/saved
+    output both reflect the FPR-adjusted mask instead.
+
+    Returns:
+        (avg_meters, per_patient_metrics, total_inference_time, total_slices)
+    """
+    avg_meters = {'iou': AverageMeter(), 'dice': AverageMeter()}
+    per_patient_metrics = {}
+    total_inference_time = 0.0
+    total_slices = 0
+
+    with torch.no_grad():
+        counter = 0
+        pbar = tqdm(total=len(loader), desc=desc)
+
+        for images, target, pids in loader:
+            images = images.cuda()
+            target = target.cuda()
+
+            t0 = time.time()
+            output = model(images)
+            t1 = time.time()
+            total_inference_time += (t1 - t0)
+            total_slices += images.size(0)
+
+            if classifier is None:
+                # Raw pass: score the model's logits directly.
+                batch_iou = iou_score(output, target)
+                batch_dice = dice_coef2(output, target)
+                avg_meters['iou'].update(batch_iou, images.size(0))
+                avg_meters['dice'].update(batch_dice, images.size(0))
+
+                for i in range(images.size(0)):
+                    pid = pids[i]
+                    slice_iou = iou_score(output[i].unsqueeze(0), target[i].unsqueeze(0))
+                    slice_dice = dice_coef2(output[i].unsqueeze(0), target[i].unsqueeze(0))
+                    per_patient_metrics.setdefault(pid, {"dice_vals": [], "iou_vals": []})
+                    per_patient_metrics[pid]["dice_vals"].append(slice_dice.item())
+                    per_patient_metrics[pid]["iou_vals"].append(slice_iou.item())
+
+                thresholded = torch.sigmoid(output)
+                thresholded = (thresholded > 0.5).float().cpu().numpy()
+                thresholded = np.squeeze(thresholded, axis=1)
+
+                for i in range(thresholded.shape[0]):
+                    save_output(thresholded[i:i + 1], output_dir, image_paths, counter)
+                    save_grad_cam(thresholded[i:i + 1], grad_cam_dir, image_paths, counter, grad_cam_generator)
+                    counter += 1
+
+            else:
+                # FPR pass: apply the classifier to each thresholded mask, then score that.
+                thresholded = torch.sigmoid(output)
+                thresholded = (thresholded > 0.5).float().cpu().numpy()
+                thresholded = np.squeeze(thresholded, axis=1)
+
+                batch_masks = []
+                for i in range(thresholded.shape[0]):
+                    pid = pids[i]
+                    fpr_mask = apply_fpr_classifier(thresholded[i], classifier,
+                                                     distance_threshold=distance_threshold)
+                    batch_masks.append(fpr_mask)
+
+                    save_output(fpr_mask[np.newaxis, :, :], output_dir, image_paths, counter)
+                    save_grad_cam(fpr_mask[np.newaxis, :, :], grad_cam_dir, image_paths, counter, grad_cam_generator)
+
+                    slice_iou = iou_score(torch.tensor(fpr_mask).unsqueeze(0).unsqueeze(0),
+                                           target[i].unsqueeze(0).unsqueeze(0))
+                    slice_dice = dice_coef2(torch.tensor(fpr_mask).unsqueeze(0).unsqueeze(0),
+                                             target[i].unsqueeze(0).unsqueeze(0))
+                    per_patient_metrics.setdefault(pid, {"dice_vals": [], "iou_vals": []})
+                    per_patient_metrics[pid]["dice_vals"].append(slice_dice.item())
+                    per_patient_metrics[pid]["iou_vals"].append(slice_iou.item())
+
+                    counter += 1
+
+                batch_masks = np.array(batch_masks)
+                batch_iou = iou_score(torch.tensor(batch_masks).unsqueeze(1), target)
+                batch_dice = dice_coef2(torch.tensor(batch_masks).unsqueeze(1), target)
+                avg_meters['iou'].update(batch_iou, images.size(0))
+                avg_meters['dice'].update(batch_dice, images.size(0))
+
+            pbar.set_postfix({'iou': avg_meters['iou'].avg, 'dice': avg_meters['dice'].avg})
+            pbar.update(1)
+
+        pbar.close()
+    print("=" * 50)
+
+    return avg_meters, per_patient_metrics, total_inference_time, total_slices
+
+
+def summarize_patient_metrics(per_patient_metrics):
+    """Returns (mean_dice_across_patients, mean_iou_across_patients)."""
+    patient_dice = [np.mean(dct["dice_vals"]) for dct in per_patient_metrics.values()]
+    patient_iou = [np.mean(dct["iou_vals"]) for dct in per_patient_metrics.values()]
+    return np.mean(patient_dice), np.mean(patient_iou)
+
+
+#############################
+# FP Classifier Training
 #############################
 def train_fpr_classifier(fp_out_dir, meta_csv, clean_meta_csv, IMAGE_DIR, MASK_DIR, CLEAN_DIR_IMG, CLEAN_DIR_MASK, model):
     print("Training FP classifier (no pre-trained classifier found)...")
@@ -211,11 +323,11 @@ def train_fpr_classifier(fp_out_dir, meta_csv, clean_meta_csv, IMAGE_DIR, MASK_D
     meta['mask_image'] = meta['mask_image'].apply(lambda x: MASK_DIR + x + '.npy')
     clean_meta['original_image'] = clean_meta['original_image'].apply(lambda x: CLEAN_DIR_IMG + x + '.npy')
     clean_meta['mask_image'] = clean_meta['mask_image'].apply(lambda x: CLEAN_DIR_MASK + x + '.npy')
-    
+
     # Use both Train and Validation as training set
     normal_train = meta[meta['data_split'].isin(['Train', 'Validation'])].copy()
     clean_train = clean_meta[clean_meta['data_split'].isin(['Train', 'Validation'])].copy()
-    
+
     features_list = []
     print("Extracting features from normal training samples...")
     for idx, row in tqdm(normal_train.iterrows(), total=len(normal_train), desc="Normal features"):
@@ -232,7 +344,7 @@ def train_fpr_classifier(fp_out_dir, meta_csv, clean_meta_csv, IMAGE_DIR, MASK_D
             pred_mask = (output > 0.5).float().cpu().numpy()[0, 0]
         detection_label = is_true_detection(pred_mask, gt_mask, distance_threshold=80)
         morph_feats = extract_morphological_features(pred_mask)
-        
+
         feat_dict = {
             'area': morph_feats[0],
             'perimeter': morph_feats[1],
@@ -242,7 +354,7 @@ def train_fpr_classifier(fp_out_dir, meta_csv, clean_meta_csv, IMAGE_DIR, MASK_D
             'label': detection_label
         }
         features_list.append(feat_dict)
-        
+
     print("Extracting features from clean training samples...")
     for idx, row in tqdm(clean_train.iterrows(), total=len(clean_train), desc="Clean features"):
         try:
@@ -270,12 +382,12 @@ def train_fpr_classifier(fp_out_dir, meta_csv, clean_meta_csv, IMAGE_DIR, MASK_D
             'label': detection_label
         }
         features_list.append(feat_dict)
-    
+
     features_df = pd.DataFrame(features_list)
     features_csv = os.path.join(fp_out_dir, "features.csv")
     features_df.to_csv(features_csv, index=False)
     print(f"Features saved to {features_csv}")
-    
+
     feature_columns = ['area', 'perimeter', 'eccentricity', 'solidity', 'compactness']
     X = features_df[feature_columns].values
     y = features_df['label'].values
@@ -362,25 +474,25 @@ def main():
     else:
         grad_cam = GradCAM(model, model.down2)  # Normal UNet architecture
 
-
-    # Fixed directories for data - define your own paths here to the preprocessing directory. 
-    IMAGE_DIR = '/dcs/22/u2202609/year_3/cs310/Project/Preprocessing/data/Image/'
-    MASK_DIR = '/dcs/22/u2202609/year_3/cs310/Project/Preprocessing/data/Mask/'
-    CLEAN_DIR_IMG = '/dcs/22/u2202609/year_3/cs310/Project/Preprocessing/data/Clean/Image/'
-    CLEAN_DIR_MASK = '/dcs/22/u2202609/year_3/cs310/Project/Preprocessing/data/Clean/Mask/'
+    # Data directories, resolved relative to this script's location so the
+    # repo is runnable on any machine without editing hardcoded paths.
+    SCRIPT_DIR = Path(__file__).resolve().parent
+    PREPROCESSING_DIR = SCRIPT_DIR.parent / 'preprocessing'
+    IMAGE_DIR = str(PREPROCESSING_DIR / 'data' / 'Image') + os.sep
+    MASK_DIR = str(PREPROCESSING_DIR / 'data' / 'Mask') + os.sep
+    CLEAN_DIR_IMG = str(PREPROCESSING_DIR / 'data' / 'Clean' / 'Image') + os.sep
+    CLEAN_DIR_MASK = str(PREPROCESSING_DIR / 'data' / 'Clean' / 'Mask') + os.sep
 
     # Load meta CSVs for test sets (normal and clean)
-    meta_df = pd.read_csv('/dcs/22/u2202609/year_3/cs310/Project/Preprocessing/csv/meta.csv')
+    meta_df = pd.read_csv(PREPROCESSING_DIR / 'csv' / 'meta.csv')
     meta_df['original_image'] = meta_df['original_image'].apply(lambda x: IMAGE_DIR + x + '.npy')
     meta_df['mask_image'] = meta_df['mask_image'].apply(lambda x: MASK_DIR + x + '.npy')
     test_meta = meta_df[meta_df['data_split'] == 'Test']
 
-    clean_meta_df = pd.read_csv('/dcs/22/u2202609/year_3/cs310/Project/Preprocessing/csv/clean_meta.csv')
+    clean_meta_df = pd.read_csv(PREPROCESSING_DIR / 'csv' / 'clean_meta.csv')
     clean_meta_df['original_image'] = clean_meta_df['original_image'].apply(lambda x: CLEAN_DIR_IMG + x + '.npy')
     clean_meta_df['mask_image'] = clean_meta_df['mask_image'].apply(lambda x: CLEAN_DIR_MASK + x + '.npy')
     clean_test_meta = clean_meta_df[clean_meta_df['data_split'] == 'Test']
-
-
 
     # ----------------------------------------
     # Prepare test datasets and DataLoaders
@@ -427,8 +539,8 @@ def main():
 
     if not os.path.exists(classifier_path):
         # If classifier does not exist, train a new FPR classifier
-        meta_csv = os.path.join(base_dir, '..', 'Preprocessing', 'csv', 'meta.csv')
-        clean_meta_csv = os.path.join(base_dir, '..', 'Preprocessing', 'csv', 'clean_meta.csv')
+        meta_csv = PREPROCESSING_DIR / 'csv' / 'meta.csv'
+        clean_meta_csv = PREPROCESSING_DIR / 'csv' / 'clean_meta.csv'
 
         # Train the classifier using both normal and clean datasets
         classifier = train_fpr_classifier(
@@ -445,82 +557,20 @@ def main():
         # Otherwise, load existing classifier
         classifier = joblib.load(classifier_path)
 
-    
-        #############################
+    #############################
     # First pass: Raw predictions for normal test set
     #############################
 
-    # Initialize average meters for IoU and Dice metrics
-    avg_meters = {'iou': AverageMeter(), 'dice': AverageMeter()}
-    
-    # Initialize dictionary to collect per-patient slice metrics
-    per_patient_metrics_raw = {}
-    
-    # Track total inference time and total number of slices
-    total_inference_time = 0.0
-    total_slices = 0
-
-    with torch.no_grad():
-        counter = 0  # Counter to track number of slices processed
-        pbar = tqdm(total=len(test_loader), desc="Raw predictions (Normal)")  # Progress bar
-        raw_predictions = []
-
-        for (input, target, pids) in test_loader:
-            input = input.cuda()    # Move input images to GPU
-            target = target.cuda()  # Move target masks to GPU
-
-            # Time inference
-            t0 = time.time()
-            output = model(input)   # Forward pass through model
-            t1 = time.time()
-            total_inference_time += (t1 - t0)
-            total_slices += input.size(0)
-
-            # Compute IoU and Dice for the batch
-            iou = iou_score(output, target)
-            dice = dice_coef2(output, target)
-            avg_meters['iou'].update(iou, input.size(0))
-            avg_meters['dice'].update(dice, input.size(0))
-
-            # Compute per-slice metrics
-            for i in range(input.size(0)):
-                pid = pids[i]
-                slice_iou = iou_score(output[i].unsqueeze(0), target[i].unsqueeze(0))
-                slice_dice = dice_coef2(output[i].unsqueeze(0), target[i].unsqueeze(0))
-
-                if pid not in per_patient_metrics_raw:
-                    per_patient_metrics_raw[pid] = {"dice_vals": [], "iou_vals": []}
-
-                per_patient_metrics_raw[pid]["dice_vals"].append(slice_dice.item())
-                per_patient_metrics_raw[pid]["iou_vals"].append(slice_iou.item())
-
-            # Post-process outputs: apply sigmoid and threshold at 0.5
-            output = torch.sigmoid(output)
-            output = (output > 0.5).float().cpu().numpy()
-            output = np.squeeze(output, axis=1)
-            raw_predictions.append(output)
-
-            # Save outputs and Grad-CAMs
-            for i in range(output.shape[0]):
-                save_output(output[i:i+1], OUTPUT_MASK_DIR, test_image_paths, counter)
-                save_grad_cam(output[i:i+1], GRAD_CAM_DIR, test_image_paths, counter, grad_cam)
-                counter += 1
-
-            pbar.update(1)
-            pbar.set_postfix({'iou': avg_meters['iou'].avg, 'dice': avg_meters['dice'].avg})
-
-        pbar.close()
-    print("=" * 50)
+    avg_meters, per_patient_metrics_raw, total_inference_time, total_slices = run_inference_pass(
+        test_loader, model, OUTPUT_MASK_DIR, GRAD_CAM_DIR, test_image_paths, grad_cam,
+        desc="Raw predictions (Normal)"
+    )
 
     # Compute average inference time per slice
     avg_inference_ms_raw = (total_inference_time / total_slices) * 1000.0
-    # print(f'Avg inference time per slice (Raw): {avg_inference_ms_raw:.2f} ms')
 
     # Compute unweighted (patient-level) averages
-    raw_patient_dice = [np.mean(dct["dice_vals"]) for dct in per_patient_metrics_raw.values()]
-    raw_patient_iou  = [np.mean(dct["iou_vals"])  for dct in per_patient_metrics_raw.values()]
-    unweighted_dice_raw = np.mean(raw_patient_dice)
-    unweighted_iou_raw  = np.mean(raw_patient_iou)
+    unweighted_dice_raw, unweighted_iou_raw = summarize_patient_metrics(per_patient_metrics_raw)
 
     print('Unweighted Raw DICE (Normal): {:.4f}'.format(unweighted_dice_raw))
     print('Unweighted Raw IoU (Normal): {:.4f}'.format(unweighted_iou_raw))
@@ -564,77 +614,22 @@ def main():
     CLEAN_OUTPUT_MASK_DIR = os.path.join(os.getcwd(), 'model_outputs', folder, 'Segmentation_output', CLEAN_NAME)
     CLEAN_GRAD_CAM_DIR = os.path.join(os.getcwd(), 'model_outputs', folder, 'Grad_CAM_output', CLEAN_NAME)
 
-    # Initialize average meters for clean test set
-    avg_meters_clean = {'iou': AverageMeter(), 'dice': AverageMeter()}
-    per_patient_metrics_clean = {}
-    total_inference_time = 0.0
-    total_slices = 0
-
-    with torch.no_grad():
-        counter = 0
-        pbar = tqdm(total=len(clean_test_loader), desc="Raw predictions (Clean)")
-        
-        for (input, target, pids) in clean_test_loader:
-            input = input.cuda()
-            target = target.cuda()
-
-            # Time inference
-            t0 = time.time()
-            output = model(input)
-            t1 = time.time()
-            total_inference_time += (t1 - t0)
-            total_slices += input.size(0)
-
-            # Compute IoU and Dice for the batch
-            iou = iou_score(output, target)
-            dice = dice_coef2(output, target)
-            avg_meters_clean['iou'].update(iou, input.size(0))
-            avg_meters_clean['dice'].update(dice, input.size(0))
-
-            # Compute per-slice metrics
-            for i in range(input.size(0)):
-                pid = pids[i]
-                slice_iou = iou_score(output[i].unsqueeze(0), target[i].unsqueeze(0))
-                slice_dice = dice_coef2(output[i].unsqueeze(0), target[i].unsqueeze(0))
-
-                if pid not in per_patient_metrics_clean:
-                    per_patient_metrics_clean[pid] = {"dice_vals": [], "iou_vals": []}
-
-                per_patient_metrics_clean[pid]["dice_vals"].append(slice_dice.item())
-                per_patient_metrics_clean[pid]["iou_vals"].append(slice_iou.item())
-
-            # Post-process outputs: apply sigmoid and threshold at 0.5
-            output = torch.sigmoid(output)
-            output = (output > 0.5).float().cpu().numpy()
-            output = np.squeeze(output, axis=1)
-
-            # Save outputs and Grad-CAMs
-            for i in range(output.shape[0]):
-                save_output(output[i:i+1], CLEAN_OUTPUT_MASK_DIR, clean_test_image_paths, counter)
-                save_grad_cam(output[i:i+1], CLEAN_GRAD_CAM_DIR, clean_test_image_paths, counter, grad_cam)
-                counter += 1
-
-            pbar.update(1)
-
-        pbar.close()
-    print("=" * 50)
+    avg_meters_clean, per_patient_metrics_clean, total_inference_time, total_slices = run_inference_pass(
+        clean_test_loader, model, CLEAN_OUTPUT_MASK_DIR, CLEAN_GRAD_CAM_DIR, clean_test_image_paths, grad_cam,
+        desc="Raw predictions (Clean)"
+    )
 
     # Compute average inference time per slice
     avg_inference_ms_clean = (total_inference_time / total_slices) * 1000.0
 
     # Compute unweighted (patient-level) averages
-    clean_patient_dice = [np.mean(dct["dice_vals"]) for dct in per_patient_metrics_clean.values()]
-    clean_patient_iou  = [np.mean(dct["iou_vals"])  for dct in per_patient_metrics_clean.values()]
-    unweighted_dice_clean = np.mean(clean_patient_dice)
-    unweighted_iou_clean  = np.mean(clean_patient_iou)
+    unweighted_dice_clean, unweighted_iou_clean = summarize_patient_metrics(per_patient_metrics_clean)
 
     print('Unweighted Clean DICE: {:.4f}'.format(unweighted_dice_clean))
     print('Unweighted Clean IoU: {:.4f}'.format(unweighted_iou_clean))
 
     # Calculate confusion matrix and derive performance metrics
-    clean_confusion_matrix = calculate_fp_clean_dataset(
-        os.path.join(base_dir, 'model_outputs', folder, 'Segmentation_output', CLEAN_OUTPUT_MASK_DIR)
-    )
+    clean_confusion_matrix = calculate_fp_clean_dataset(CLEAN_OUTPUT_MASK_DIR)
     tp_clean, tn_clean, fp_clean, fn_clean = clean_confusion_matrix
     precision_clean = calculate_precision(tp_clean, fp_clean)
     recall_clean = calculate_recall(tp_clean, fn_clean)
@@ -662,7 +657,7 @@ def main():
     save_metrics_to_csv(metrics_clean, METRICS_DIR, filename="metrics_clean.csv")
     print("Raw metrics (Clean) saved.")
 
-        #############################
+    #############################
     # Save per-patient raw and clean slice metrics
     #############################
 
@@ -700,80 +695,17 @@ def main():
     # Second pass: FPR post-processing on normal test set
     #############################
 
-    # Initialize average meters for FPR post-processed results
-    avg_meters_fpr = {'iou': AverageMeter(), 'dice': AverageMeter()}
-    per_patient_metrics_fpr = {}  # Dictionary to accumulate per-patient metrics
-    total_inference_time = 0.0
-    total_slices = 0
-
-    with torch.no_grad():
-        counter = 0
-        pbar = tqdm(total=len(test_loader), desc="FPR post-processing (Normal)")
-
-        for input, target, pids in test_loader:
-            input = input.cuda()
-            target = target.cuda()
-
-            # Time inference
-            t0 = time.time()
-            output = model(input)
-            t1 = time.time()
-            total_inference_time += (t1 - t0)
-            total_slices += input.size(0)
-
-            # Post-process output
-            output = torch.sigmoid(output)
-            output = (output > 0.5).float().cpu().numpy()
-            output = np.squeeze(output, axis=1)
-
-            batch_fpr = []  # Store FPR masks for the batch
-
-            for j in range(output.shape[0]):
-                pid = pids[j]
-
-                # Apply FPR classifier
-                fpr_mask = apply_fpr_classifier(output[j], classifier,
-                                                distance_threshold=args['distance_threshold'])
-                batch_fpr.append(fpr_mask)
-
-                # Save FPR output and Grad-CAM
-                save_output(fpr_mask[np.newaxis, :, :], OUTPUT_MASK_DIR, test_image_paths, counter)
-                save_grad_cam(fpr_mask[np.newaxis, :, :], GRAD_CAM_DIR, test_image_paths, counter, grad_cam)
-
-                # Compute and store per-slice metrics
-                slice_iou_fpr = iou_score(torch.tensor(fpr_mask).unsqueeze(0).unsqueeze(0),
-                                          target[j].unsqueeze(0).unsqueeze(0))
-                slice_dice_fpr = dice_coef2(torch.tensor(fpr_mask).unsqueeze(0).unsqueeze(0),
-                                            target[j].unsqueeze(0).unsqueeze(0))
-
-                if pid not in per_patient_metrics_fpr:
-                    per_patient_metrics_fpr[pid] = {"dice_vals": [], "iou_vals": []}
-                per_patient_metrics_fpr[pid]["dice_vals"].append(slice_dice_fpr.item())
-                per_patient_metrics_fpr[pid]["iou_vals"].append(slice_iou_fpr.item())
-
-                counter += 1
-
-            # Update batch metrics
-            batch_fpr = np.array(batch_fpr)
-            iou_fpr = iou_score(torch.tensor(batch_fpr).unsqueeze(1), target)
-            dice_fpr = dice_coef2(torch.tensor(batch_fpr).unsqueeze(1), target)
-            avg_meters_fpr['iou'].update(iou_fpr, input.size(0))
-            avg_meters_fpr['dice'].update(dice_fpr, input.size(0))
-
-            pbar.set_postfix({'iou': avg_meters_fpr['iou'].avg, 'dice': avg_meters_fpr['dice'].avg})
-            pbar.update(1)
-
-        pbar.close()
-    print("=" * 50)
+    avg_meters_fpr, per_patient_metrics_fpr, total_inference_time, total_slices = run_inference_pass(
+        test_loader, model, OUTPUT_MASK_DIR, GRAD_CAM_DIR, test_image_paths, grad_cam,
+        desc="FPR post-processing (Normal)", classifier=classifier,
+        distance_threshold=args['distance_threshold']
+    )
 
     # Calculate average inference time per slice
     avg_inference_ms_fpr = (total_inference_time / total_slices) * 1000.0
 
     # Compute unweighted (patient-level) averages after FPR
-    fpr_patient_dice = [np.mean(dct["dice_vals"]) for dct in per_patient_metrics_fpr.values()]
-    fpr_patient_iou  = [np.mean(dct["iou_vals"]) for dct in per_patient_metrics_fpr.values()]
-    unweighted_dice_fpr = np.mean(fpr_patient_dice)
-    unweighted_iou_fpr  = np.mean(fpr_patient_iou)
+    unweighted_dice_fpr, unweighted_iou_fpr = summarize_patient_metrics(per_patient_metrics_fpr)
 
     print('Unweighted FPR DICE (Normal): {:.4f}'.format(unweighted_dice_fpr))
     print('Unweighted FPR IoU (Normal): {:.4f}'.format(unweighted_iou_fpr))
@@ -810,89 +742,23 @@ def main():
     # Third pass: FPR post-processing on clean test set
     #############################
 
-    # Initialize average meters for clean FPR results
-    avg_meters_fpr_clean = {'iou': AverageMeter(), 'dice': AverageMeter()}
-    per_patient_metrics_fpr_clean = {}  # Store per-patient FPR metrics
-    total_inference_time = 0.0
-    total_slices = 0
-
-    with torch.no_grad():
-        counter = 0
-        pbar = tqdm(total=len(clean_test_loader), desc="FPR post-processing (Clean)")
-
-        for input, target, pids in clean_test_loader:
-            input = input.cuda()
-            target = target.cuda()
-
-            # Time inference
-            t0 = time.time()
-            output = model(input)
-            t1 = time.time()
-            total_inference_time += (t1 - t0)
-            total_slices += input.size(0)
-
-            # Post-process outputs
-            output = torch.sigmoid(output)
-            output = (output > 0.5).float().cpu().numpy()
-            output = np.squeeze(output, axis=1)
-
-            batch_fpr = []
-
-            for j in range(output.shape[0]):
-                pid = pids[j]
-
-                # Apply FPR classifier
-                fpr_mask = apply_fpr_classifier(output[j], classifier,
-                                                distance_threshold=args['distance_threshold'])
-                batch_fpr.append(fpr_mask)
-
-                # Save outputs
-                save_output(fpr_mask[np.newaxis, :, :], CLEAN_OUTPUT_MASK_DIR, clean_test_image_paths, counter)
-                save_grad_cam(fpr_mask[np.newaxis, :, :], CLEAN_GRAD_CAM_DIR, clean_test_image_paths, counter, grad_cam)
-
-                # Compute per-slice clean FPR metrics
-                slice_iou_fpr = iou_score(torch.tensor(fpr_mask).unsqueeze(0).unsqueeze(0),
-                                          target[j].unsqueeze(0).unsqueeze(0))
-                slice_dice_fpr = dice_coef2(torch.tensor(fpr_mask).unsqueeze(0).unsqueeze(0),
-                                            target[j].unsqueeze(0).unsqueeze(0))
-
-                if pid not in per_patient_metrics_fpr_clean:
-                    per_patient_metrics_fpr_clean[pid] = {"dice_vals": [], "iou_vals": []}
-                per_patient_metrics_fpr_clean[pid]["dice_vals"].append(slice_dice_fpr.item())
-                per_patient_metrics_fpr_clean[pid]["iou_vals"].append(slice_iou_fpr.item())
-
-                counter += 1
-
-            # Update batch metrics
-            batch_fpr = np.array(batch_fpr)
-            iou_fpr = iou_score(torch.tensor(batch_fpr).unsqueeze(1), target)
-            dice_fpr = dice_coef2(torch.tensor(batch_fpr).unsqueeze(1), target)
-            avg_meters_fpr_clean['iou'].update(iou_fpr, input.size(0))
-            avg_meters_fpr_clean['dice'].update(dice_fpr, input.size(0))
-
-            pbar.set_postfix({'iou': avg_meters_fpr_clean['iou'].avg,
-                              'dice': avg_meters_fpr_clean['dice'].avg})
-            pbar.update(1)
-
-        pbar.close()
-    print("=" * 50)
+    avg_meters_fpr_clean, per_patient_metrics_fpr_clean, total_inference_time, total_slices = run_inference_pass(
+        clean_test_loader, model, CLEAN_OUTPUT_MASK_DIR, CLEAN_GRAD_CAM_DIR, clean_test_image_paths, grad_cam,
+        desc="FPR post-processing (Clean)", classifier=classifier,
+        distance_threshold=args['distance_threshold']
+    )
 
     # Calculate average inference time per slice
     avg_inference_ms_fpr_clean = (total_inference_time / total_slices) * 1000.0
 
     # Compute unweighted (patient-level) averages after FPR (clean)
-    fpr_clean_patient_dice = [np.mean(dct["dice_vals"]) for dct in per_patient_metrics_fpr_clean.values()]
-    fpr_clean_patient_iou  = [np.mean(dct["iou_vals"]) for dct in per_patient_metrics_fpr_clean.values()]
-    unweighted_dice_fpr_clean = np.mean(fpr_clean_patient_dice)
-    unweighted_iou_fpr_clean  = np.mean(fpr_clean_patient_iou)
+    unweighted_dice_fpr_clean, unweighted_iou_fpr_clean = summarize_patient_metrics(per_patient_metrics_fpr_clean)
 
     print('Unweighted FPR Clean DICE: {:.4f}'.format(unweighted_dice_fpr_clean))
     print('Unweighted FPR Clean IoU: {:.4f}'.format(unweighted_iou_fpr_clean))
 
     # Calculate clean confusion matrix and metrics
-    clean_confusion_matrix_fpr = calculate_fp_clean_dataset(
-        os.path.join(base_dir, 'model_outputs', folder, 'Segmentation_output', CLEAN_OUTPUT_MASK_DIR)
-    )
+    clean_confusion_matrix_fpr = calculate_fp_clean_dataset(CLEAN_OUTPUT_MASK_DIR)
     tp_clean_fpr, tn_clean_fpr, fp_clean_fpr, fn_clean_fpr = clean_confusion_matrix_fpr
     precision_clean_fpr = calculate_precision(tp_clean_fpr, fp_clean_fpr)
     recall_clean_fpr = calculate_recall(tp_clean_fpr, fn_clean_fpr)

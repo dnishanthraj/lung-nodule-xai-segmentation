@@ -12,7 +12,7 @@ ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 # -------------------------------------------------------
 # Base Directory for Model Outputs (predictions, grad-cam, metrics)
 # -------------------------------------------------------
-MODEL_OUTPUTS_BASE_DIR = os.path.join(ROOT_DIR, "Segmentation/model_outputs")
+MODEL_OUTPUTS_BASE_DIR = os.path.join(ROOT_DIR, "segmentation/model_outputs")
 
 # -------------------------------------------------------
 # Dynamic Paths (set later during runtime)
@@ -24,5 +24,5 @@ METRICS_DIR = ""       # Path where model evaluation metrics will be loaded from
 # -------------------------------------------------------
 # Fixed Data Paths (preprocessed images and masks)
 # -------------------------------------------------------
-IMAGE_DIR = os.path.join(ROOT_DIR, "Preprocessing/data/Image")  # Directory containing original CT images
-MASK_DIR = os.path.join(ROOT_DIR, "Preprocessing/data/Mask")    # Directory containing ground-truth masks
+IMAGE_DIR = os.path.join(ROOT_DIR, "preprocessing/data/Image")  # Directory containing original CT images
+MASK_DIR = os.path.join(ROOT_DIR, "preprocessing/data/Mask")    # Directory containing ground-truth masks
